@@ -1,0 +1,166 @@
+/* eslint-disable no-undef */
+/** Snippet for the iframe. Initializes the inner Drift iframe and acts as a communcation layer for the parent page. */
+window.drift =
+  window.drift ||
+  function () {
+    (drift.q = drift.q || []).push(arguments);
+  };
+
+const LOGGED_IN_INTERACTION_ID = 356410;
+
+// rebroadcast drift widget API events to parent page
+drift("on", "iframeResize", function (data) {
+  window.parent.postMessage({ type: "driftIframeResize", data }, "*");
+});
+
+drift("on", "message:sent", function (data) {
+  window.sessionStorage.setItem("driftInteracted", "yes");
+  window.sessionStorage.setItem("driftConversationId", data.conversationId);
+});
+
+drift("on", "sidebarClose", function (e) {
+  // use this if you want new playbooks to fire / don't want the current conversation to pop up again
+  // if the site visitor closes out the chat
+  // the end result is that the conversation only "follows" you around the website if you don't X out of the chat
+  window.sessionStorage.removeItem("driftInteracted");
+  window.sessionStorage.removeItem("driftConversationId");
+});
+
+drift("on", "ready", function () {
+  var hasInteractedThisSession = window.sessionStorage.getItem("driftInteracted") === "yes";
+  if (hasInteractedThisSession) {
+    var conversationId = window.sessionStorage.getItem("driftConversationId");
+    drift.api.goToConversation(parseInt(conversationId));
+  }
+  document.querySelector(".drift-frame-controller").style.zIndex = 99999;
+});
+
+// START loggedInDriftChat
+drift("on", "conversation:playbookFired", data => {
+  window.sessionStorage.setItem("lastFiredInteractionId", data.interactionId);
+});
+// END loggedInDriftChat
+
+window.addEventListener("message", function (event) {
+  if (event.source !== window.parent) {
+    return;
+  }
+
+  const message = event.data;
+
+  if (message == null) return;
+
+  // set initial context, put widget in "iframeMode", load widget
+  if (message.type === "driftSetContext") {
+    // START loggedInDriftChat
+    const isLoggedIn = message?.data?.isLoggedIn;
+    let lastFiredInteractionId;
+
+    try {
+      // using window.sessionStorage in iframe will throw exception in incognito mode, so wrap this call in a try-catch
+      lastFiredInteractionId = window.sessionStorage.getItem("lastFiredInteractionId");
+    } catch {} // eslint-disable-line
+
+    if (lastFiredInteractionId === LOGGED_IN_INTERACTION_ID.toString()) {
+      // if the last playbook fired was the logged-in playbook AND the user is currently not logged in, then clear Drift state
+      if (!isLoggedIn) {
+        // drift.reset() is supposed to clear both cookies, but somehow, it's only clearing `drift_aid`,
+        // which leads to showing the last conversation and potentially exposing PII
+        // Manually clearing the cookies appear to be the only surefire to way reset state
+        ["drift_aid", "driftt_aid"].forEach(name => {
+          document.cookie = `${name}=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;SameSite=None;secure;`;
+        });
+        window.sessionStorage.removeItem("lastFiredInteractionId");
+        window.sessionStorage.removeItem("driftInteracted");
+      }
+    }
+    // END loggedInDriftChat
+
+    drift("setContext", message.data);
+    drift("config", {
+      iframeMode: true,
+      cookieDomain: ".asana.com",
+    });
+    drift("page");
+    drift("init", "d8f2c7r5ihvm"); // Your Drift embed ID goes in the 2nd argument
+    if (message?.data?.gaClientId) {
+      drift("api", "setUserAttributes", {
+        gaId: message.data.gaClientId,
+      });
+    }
+  }
+
+  if (message.type === "collectFormData") {
+    window.drift.api.collectFormData(message.data.userInput, {
+      ...message.data.campaignId,
+      ...message.data.followupUrl,
+    });
+  }
+
+  // START loggedInDriftChat
+  if (message.type === "initLoggedInPlaybook") {
+    let hasInteractedThisSession = false;
+
+    try {
+      // using window.sessionStorage in iframe will throw exception in incognito mode, so wrap this call in a try-catch
+      hasInteractedThisSession = window.sessionStorage.getItem("driftInteracted") === "yes";
+    } catch {} // eslint-disable-line
+
+    if (!hasInteractedThisSession) {
+      if (message?.data?.user_first_name) {
+        const { user_first_name, user_last_name, user_email } = message.data;
+
+        drift("api", "setUserAttributes", {
+          first_name: user_first_name,
+          last_name: user_last_name,
+          email: user_email,
+        });
+      }
+
+      drift("api", "startInteraction", {
+        interactionId: LOGGED_IN_INTERACTION_ID,
+        goToConversation: false, // don't auto-expand
+        replaceActiveConversation: true,
+      });
+    }
+  }
+  // END loggedInDriftChat
+});
+
+// indicate iframe is ready to receive context
+window.parent.postMessage({ type: "driftIframeReady" }, "*");
+
+/*
+ * We want to capture all of these events and send their info to GA,
+ * however, we don't really care about the format of the event data.
+ */
+function sendEventPayloadToWebsite(eventName, payload) {
+  window.parent.postMessage(
+    {
+      type: "driftGenericGAEvent",
+      eventName,
+      payload,
+    },
+    "*",
+  );
+}
+
+const GENERIC_EVENTS_FOR_GA = [
+  "startConversation",
+  "message:sent",
+  "message",
+  "emailCapture",
+  "phoneCapture",
+  "scheduling:meetingBooked",
+  "conversation:playbookFired",
+  "conversation:playbookClicked",
+  "conversation:playbookDismissed",
+  "conversation:buttonClicked",
+  "conversation:firstInteraction",
+];
+
+for (const eventName of GENERIC_EVENTS_FOR_GA) {
+  drift("on", eventName, function (payload) {
+    sendEventPayloadToWebsite(eventName, payload);
+  });
+}
